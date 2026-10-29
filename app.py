@@ -651,7 +651,9 @@ def _build_svod_sheet(ws, svod_rows: list, ozon_data: dict, wb_data: dict, perio
     row += 1
 
     # Берём итоговую сумму Ozon к перечислению
-    df_raw_ozon = ozon_data.get('начисления') or ozon_data.get('сводка')
+    df_raw_ozon = ozon_data.get('начисления')
+    if df_raw_ozon is None:
+        df_raw_ozon = ozon_data.get('сводка')
     ozon_itog = None
     if df_raw_ozon is not None and not df_raw_ozon.empty:
         sections = _parse_ozon_nacisleniya(df_raw_ozon)
@@ -809,7 +811,9 @@ def _build_ozon_svod(ws, ozon_data: dict, period: str):
     row += 2
 
     # Получаем данные из листа начислений
-    df_raw = ozon_data.get('начисления') or ozon_data.get('сводка')
+    df_raw = ozon_data.get('начисления')
+    if df_raw is None:
+        df_raw = ozon_data.get('сводка')
 
     if df_raw is not None and not df_raw.empty:
         sections = _parse_ozon_nacisleniya(df_raw)
