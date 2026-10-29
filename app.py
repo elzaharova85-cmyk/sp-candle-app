@@ -997,8 +997,11 @@ def main():
 
                 ozon_data = {}
                 if f_ozon is not None:
-                    ozon_data = parse_ozon_file(f_ozon)
-                    st.success('✅ Ozon загружен')
+                    try:
+                        ozon_data = parse_ozon_file(f_ozon)
+                        st.success(f'✅ Ozon загружен (ключи: {list(ozon_data.keys())})')
+                    except Exception as e:
+                        st.error(f'❌ Ошибка Ozon: {e}')
 
                 wb_data = {}
                 if f_wb_zips:
