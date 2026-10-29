@@ -131,17 +131,37 @@ def parse_ozon_file(file_obj) -> dict:
     raw = file_obj.read()
     xl = pd.ExcelFile(io.BytesIO(raw))
     result = {}
+    # Сохраняем имена листов для диагностики
+    result['_sheet_names'] = xl.sheet_names
 
     for sh in xl.sheet_names:
-        sh_clean = sh.strip()
-        df = pd.read_excel(io.BytesIO(raw), sheet_name=sh, header=None)
-        if 'сводк' in sh_clean.lower():
+        sh_low = sh.strip().lower()
+        # Сводка — первый лист ИЛИ лист со "сводк"
+        if 'сводк' in sh_low or sh_low in ('сводка', 'summary'):
+            df = pd.read_excel(io.BytesIO(raw), sheet_name=sh, header=None)
             result['сводка'] = df
-        elif 'детализ' in sh_clean.lower():
+        # Детализация
+        elif 'детализ' in sh_low or sh_low in ('детализация', 'detail', 'details'):
             df2 = pd.read_excel(io.BytesIO(raw), sheet_name=sh)
             result['детализация'] = df2
-        elif 'типам' in sh_clean.lower() or 'тип' in sh_clean.lower():
+        # По типам
+        elif 'типам' in sh_low or ('тип' in sh_low and 'товар' in sh_low):
+            df = pd.read_excel(io.BytesIO(raw), sheet_name=sh, header=None)
             result['по_типам'] = df
+
+    # Если не нашли по названию — берём по позиции
+    if 'сводка' not in result and len(xl.sheet_names) >= 1:
+        sh = xl.sheet_names[0]
+        df = pd.read_excel(io.BytesIO(raw), sheet_name=sh, header=None)
+        result['сводка'] = df
+    if 'детализация' not in result and len(xl.sheet_names) >= 2:
+        sh = xl.sheet_names[1]
+        df2 = pd.read_excel(io.BytesIO(raw), sheet_name=sh)
+        result['детализация'] = df2
+    if 'по_типам' not in result and len(xl.sheet_names) >= 3:
+        sh = xl.sheet_names[2]
+        df = pd.read_excel(io.BytesIO(raw), sheet_name=sh, header=None)
+        result['по_типам'] = df
 
     return result
 
@@ -248,31 +268,32 @@ def build_excel(ms_data: dict, ozon_data: dict, wb_data: dict,
     ws_svod = wb.create_sheet('СВОДНЫЙ')
     _build_svod_sheet(ws_svod, ms_data, ozon_data, wb_data, period, sebes_dict)
 
-    channel_map = {
-        'Интернет':   [k for k in ms_data if 'интернет' in k.lower() or 'Интернет' in k],
-        'ОПТ':        [k for k in ms_data if 'опт' in k.lower() and 'свод' not in k.lower()],
-        'СТМ':        [k for k in ms_data if 'стм' in k.lower() or 'сзм' in k.lower()],
-        'Столярный':  [k for k in ms_data if 'столяр' in k.lower()],
+    # Фиксированный порядок каналов — ключи совпадают с тем, что прописано в channel_files
+    channel_display = {
+        'Интернет_сен26':  'Интернет',
+        'ОПТ_сен26':       'ОПТ',
+        'СТМ_сен26':       'СТМ',
+        'Столярный_сен26': 'Столярный',
     }
 
-    for ch_name, keys in channel_map.items():
-        if not keys:
+    for key, ch_name in channel_display.items():
+        if key not in ms_data:
             continue
-        key = keys[0]
         ws_ch = wb.create_sheet(f'МС_{ch_name}')
         _build_channel_sheet(ws_ch, ms_data[key], ch_name, period, sebes_dict)
 
-    if ozon_data:
+    ozon_real = {k: v for k, v in ozon_data.items() if not k.startswith('_')}
+    if ozon_real:
         ws_ozon_svod = wb.create_sheet('Ozon_Сводка')
-        _build_ozon_svod(ws_ozon_svod, ozon_data, period)
+        _build_ozon_svod(ws_ozon_svod, ozon_real, period)
 
-        if 'детализация' in ozon_data:
+        if 'детализация' in ozon_real:
             ws_ozon_det = wb.create_sheet('Ozon_Детализация')
-            _build_ozon_detail(ws_ozon_det, ozon_data['детализация'], sebes_dict)
+            _build_ozon_detail(ws_ozon_det, ozon_real['детализация'], sebes_dict)
 
-        if 'по_типам' in ozon_data:
+        if 'по_типам' in ozon_real:
             ws_ozon_types = wb.create_sheet('Ozon_По типам')
-            _build_raw_sheet(ws_ozon_types, ozon_data['по_типам'],
+            _build_raw_sheet(ws_ozon_types, ozon_real['по_типам'],
                              'Продажи Ozon по типам товара', COLORS['ozon_blue'])
 
     if wb_data and 'детализация' in wb_data:
@@ -544,6 +565,7 @@ def _parse_ms_channel_df(df_raw: pd.DataFrame, sebes_dict: dict) -> list:
 #  ЛИСТ: OZON
 # ─────────────────────────────────────────────
 def _extract_ozon_summary(ozon_data: dict) -> dict:
+    # Убираем служебные ключи
     if not ozon_data or 'сводка' not in ozon_data:
         return {}
     df = ozon_data['сводка']
@@ -993,9 +1015,11 @@ def main():
                 if f_ozon is not None:
                     try:
                         ozon_data = parse_ozon_file(f_ozon)
-                        st.success(f'✅ Ozon загружен (ключи: {list(ozon_data.keys())})')
+                        sheets = ozon_data.get('_sheet_names', [])
+                        found = [k for k in ozon_data if not k.startswith('_')]
+                        st.success(f'✅ Ozon загружен. Листы в файле: {sheets}. Найдено разделов: {found}')
                     except Exception as e:
-                        st.error(f'❌ Ошибка Ozon: {e}')
+                        st.error(f'❌ Ошибка Ozon: {e}\n{__import__("traceback").format_exc()}')
 
                 wb_data = {}
                 if f_wb_zips:
