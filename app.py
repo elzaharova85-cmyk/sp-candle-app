@@ -74,9 +74,11 @@ def parse_1c_file(file_obj, channel_name: str, sebes_dict: dict) -> pd.DataFrame
         tmp.write(file_obj.read())
         tmp_path = tmp.name
 
-    df_raw = pd.read_excel(tmp_path, engine='xlrd', header=None, skiprows=11)
+    # Читаем весь файл без пропуска строк
+    df_raw = pd.read_excel(tmp_path, engine='xlrd', header=None)
     os.unlink(tmp_path)
 
+    # Ищем строку с "Наименование" — это первая строка заголовка
     header_row = None
     for i, row in df_raw.iterrows():
         vals = [str(v).strip() for v in row.values if pd.notna(v)]
@@ -84,25 +86,19 @@ def parse_1c_file(file_obj, channel_name: str, sebes_dict: dict) -> pd.DataFrame
             header_row = i
             break
 
-    if header_row is None:
-        for i, row in df_raw.iterrows():
-            vals = [str(v).strip() for v in row.values if pd.notna(v)]
-            if any('кол-во' in v.lower() for v in vals):
-                header_row = i
-                break
-
-    data_start = (header_row + 2) if header_row is not None else 3
+    # Данные начинаются через 2 строки после заголовка (строки 11 и 12 — заголовки, 13 — данные)
+    data_start = (header_row + 2) if header_row is not None else 13
 
     rows = []
     for i in range(data_start, len(df_raw)):
         row = df_raw.iloc[i]
-        name = row.iloc[3] if len(row) > 3 else None
-        qty  = row.iloc[5] if len(row) > 5 else None
-        price= row.iloc[6] if len(row) > 6 else None
-        sebes_1c = row.iloc[7] if len(row) > 7 else None
-        sum_sales = row.iloc[9] if len(row) > 9 else None
-        sum_sebes = row.iloc[10] if len(row) > 10 else None
-        profit = row.iloc[13] if len(row) > 13 else None
+        name      = row.iloc[3]  if len(row) > 3  else None  # Наименование
+        qty       = row.iloc[5]  if len(row) > 5  else None  # Кол-во продаж
+        price     = row.iloc[6]  if len(row) > 6  else None  # Цена
+        sebes_1c  = row.iloc[7]  if len(row) > 7  else None  # Себестоимость ед.
+        sum_sales = row.iloc[9]  if len(row) > 9  else None  # Сумма продаж
+        sum_sebes = row.iloc[10] if len(row) > 10 else None  # Сумма себест.
+        profit    = row.iloc[20] if len(row) > 20 else None  # Прибыль (колонка 20!)
 
         if not isinstance(name, str) or len(name.strip()) < 2:
             continue
@@ -111,6 +107,8 @@ def parse_1c_file(file_obj, channel_name: str, sebes_dict: dict) -> pd.DataFrame
         try:
             qty_f = float(qty)
         except (TypeError, ValueError):
+            continue
+        if qty_f == 0:
             continue
 
         rows.append({
