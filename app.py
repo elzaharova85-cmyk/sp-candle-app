@@ -731,7 +731,7 @@ def _build_svod_sheet(ws, svod_rows: list, ozon_data: dict, wb_data: dict, perio
 def _parse_ozon_nacisleniya(df_raw: pd.DataFrame) -> dict:
     """
     Парсит лист начислений Ozon (header=None).
-    Ищет строки вида: [label, ..., value] и группирует их по секциям.
+    Ищет ТОЛЬКО агрегированные статьи по ключевым словам (не детализацию по заказам).
     Возвращает dict вида:
       {
         'продажи': {'Выручка': 1221148, 'Программы партнёров': 9310, ...},
@@ -739,30 +739,57 @@ def _parse_ozon_nacisleniya(df_raw: pd.DataFrame) -> dict:
         'итого': {'ИТОГО К ПЕРЕЧИСЛЕНИЮ ПРОДАВЦУ': 902057},
       }
     """
-    sections = {'продажи': {}, 'начисления': {}, 'итого': {}}
-    current_section = None
-
-    SECTION_MARKERS = {
-        'продажи': ['продаж', 'возврат'],
-        'начисления': ['начислени', 'удержани', 'вознаграждени', 'услуги'],
-        'итого': ['итого к перечислени', 'итого к оплате'],
+    # Известные агрегированные статьи Ozon (ключевое слово → секция + отображаемое название)
+    KNOWN_LABELS = {
+        # продажи
+        'выручка':                      ('продажи',     'Выручка'),
+        'программы партнёр':            ('продажи',     'Программы партнёров'),
+        'баллы за скидк':               ('продажи',     'Баллы за скидки'),
+        'итого продажи и возврат':      ('продажи',     'ИТОГО Продажи и возвраты'),
+        'итого по продажам':            ('продажи',     'ИТОГО Продажи и возвраты'),
+        # начисления / удержания
+        'вознаграждение ozon':          ('начисления',  'Вознаграждение Ozon'),
+        'вознаграждение озон':          ('начисления',  'Вознаграждение Ozon'),
+        'продвижение и реклам':         ('начисления',  'Продвижение и реклама'),
+        'услуги доставк':               ('начисления',  'Услуги доставки'),
+        'услуги по доставк':            ('начисления',  'Услуги доставки'),
+        'услуги ozon доставк':          ('начисления',  'Услуги Ozon Доставки'),
+        'услуги озон доставк':          ('начисления',  'Услуги Ozon Доставки'),
+        'услуги партнёр':               ('начисления',  'Услуги партнёров'),
+        'другие услуги и штраф':        ('начисления',  'Другие услуги и штрафы'),
+        'услуги fbo':                   ('начисления',  'Услуги FBO'),
+        'услуги fbs':                   ('начисления',  'Услуги FBS'),
+        'итого начислени':              ('начисления',  'ИТОГО Начисления'),
+        'итого удержани':               ('начисления',  'ИТОГО Начисления'),
+        # итог
+        'итого к перечислени':          ('итого',       'ИТОГО К ПЕРЕЧИСЛЕНИЮ ПРОДАВЦУ'),
+        'итого к оплате':               ('итого',       'ИТОГО К ПЕРЕЧИСЛЕНИЮ ПРОДАВЦУ'),
+        'к перечислени':                ('итого',       'ИТОГО К ПЕРЕЧИСЛЕНИЮ ПРОДАВЦУ'),
     }
+
+    sections: dict[str, dict] = {'продажи': {}, 'начисления': {}, 'итого': {}}
 
     for _, row in df_raw.iterrows():
         vals = [v for v in row.values if pd.notna(v) and str(v).strip() not in ('', 'nan')]
-        if not vals:
+        if len(vals) < 2:
             continue
 
         label = str(vals[0]).strip()
         label_low = label.lower()
 
-        # Определяем секцию по метке
-        for sec, markers in SECTION_MARKERS.items():
-            if any(m in label_low for m in markers):
-                current_section = sec
+        # Проверяем по известным статьям
+        matched_sec = None
+        matched_display = None
+        for kw, (sec, display) in KNOWN_LABELS.items():
+            if kw in label_low:
+                matched_sec = sec
+                matched_display = display
                 break
 
-        # Ищем числовое значение в строке (последнее числовое значение в строке)
+        if matched_sec is None:
+            continue
+
+        # Ищем числовое значение (последнее числовое в строке)
         num_val = None
         for v in reversed(vals):
             try:
@@ -771,23 +798,10 @@ def _parse_ozon_nacisleniya(df_raw: pd.DataFrame) -> dict:
             except (TypeError, ValueError):
                 continue
 
-        if num_val is not None and current_section and label_low not in ('nan',):
-            # Пропускаем строки-заголовки секций (без числа они уже попали выше)
-            is_section_header = any(
-                label_low.startswith(m) for m in
-                ['продажи и возвраты', 'начисления', 'итог']
-            )
-            if not is_section_header:
-                sections[current_section][label] = num_val
-
-    # Считаем итоговые суммы если они не нашлись явно
-    if sections['продажи'] and 'ИТОГО Продажи и возвраты' not in sections['продажи']:
-        s = sum(sections['продажи'].values())
-        sections['продажи']['ИТОГО Продажи и возвраты'] = s
-
-    if sections['начисления'] and 'ИТОГО Начисления' not in sections['начисления']:
-        s = sum(sections['начисления'].values())
-        sections['начисления']['ИТОГО Начисления'] = s
+        if num_val is not None:
+            # Для одинаковых статей суммируем (напр. если несколько строк "Услуги доставки")
+            existing = sections[matched_sec].get(matched_display, 0)
+            sections[matched_sec][matched_display] = existing + num_val
 
     return sections
 
@@ -838,56 +852,90 @@ def _build_ozon_svod(ws, ozon_data: dict, period: str):
         # ── ПРОДАЖИ И ВОЗВРАТЫ ──
         title_row(row, 'ПРОДАЖИ И ВОЗВРАТЫ', GREEN)
         row += 1
-        prod_total = 0.0
+        prod_rows_start = row
+        prod_data_rows = []   # строки с данными (не итог)
+        has_prod_itog = any('итого' in l.lower() for l in sections['продажи'])
         for label, val in sections['продажи'].items():
             is_total = 'итого' in label.lower()
             fill_r = TOTAL if is_total else WHITE
-            data_row(row, label, val, bold=is_total, fill=fill_r)
             if not is_total:
-                prod_total += val
+                prod_data_rows.append(row)
+            data_row(row, label, val, bold=is_total, fill=fill_r)
             row += 1
-        # Если ИТОГО не нашлось — пишем сами
-        if not any('итого' in l.lower() for l in sections['продажи']):
-            data_row(row, 'ИТОГО Продажи и возвраты', prod_total, bold=True, fill=TOTAL)
+        # Если ИТОГО не нашлось — добавляем формулу
+        r_prod_itog = row
+        if not has_prod_itog:
+            _write_cell(ws, row, 1, 'ИТОГО Продажи и возвраты', TOTAL, bold=True, align=left())
+            c = ws.cell(row=row, column=2)
+            if prod_data_rows:
+                c.value = f'=СУММ(B{prod_data_rows[0]}:B{prod_data_rows[-1]})'
+            else:
+                c.value = 0
+            c.number_format = '#,##0'
+            c.fill = hfill(TOTAL)
+            c.font = hfont(bold=True)
             row += 1
+        else:
+            # итог уже есть — запоминаем его строку (последняя строка продаж)
+            r_prod_itog = row - 1
         row += 1
 
         # ── НАЧИСЛЕНИЯ (УДЕРЖАНИЯ) ──
         title_row(row, 'НАЧИСЛЕНИЯ (УДЕРЖАНИЯ OZON)', YELLOW)
         row += 1
-        nach_total = 0.0
+        nach_data_rows = []
+        has_nach_itog = any('итого' in l.lower() for l in sections['начисления'])
         for label, val in sections['начисления'].items():
             is_total = 'итого' in label.lower()
             fill_r = TOTAL if is_total else WHITE
-            data_row(row, label, val, bold=is_total, fill=fill_r)
             if not is_total:
-                nach_total += val
+                nach_data_rows.append(row)
+            data_row(row, label, val, bold=is_total, fill=fill_r)
             row += 1
-        if not any('итого' in l.lower() for l in sections['начисления']):
-            data_row(row, 'ИТОГО Начисления', nach_total, bold=True, fill=TOTAL)
+        r_nach_itog = row
+        if not has_nach_itog:
+            _write_cell(ws, row, 1, 'ИТОГО Начисления', TOTAL, bold=True, align=left())
+            c = ws.cell(row=row, column=2)
+            if nach_data_rows:
+                c.value = f'=СУММ(B{nach_data_rows[0]}:B{nach_data_rows[-1]})'
+            else:
+                c.value = 0
+            c.number_format = '#,##0'
+            c.fill = hfill(TOTAL)
+            c.font = hfont(bold=True)
             row += 1
+        else:
+            r_nach_itog = row - 1
         row += 1
 
         # ── ИТОГ ──
         title_row(row, 'ИТОГ', BEIGE)
         row += 1
 
-        # Ищем итоговую сумму к перечислению
-        itog_val = None
+        # ИТОГО К ПЕРЕЧИСЛЕНИЮ — если есть в данных, используем; иначе формула
+        itog_from_data = None
         for label, val in sections['итого'].items():
-            itog_val = val
-        if itog_val is None:
-            # Считаем: продажи + начисления
-            itog_val = prod_total + nach_total
+            itog_from_data = val
 
-        data_row(row, 'ИТОГО К ПЕРЕЧИСЛЕНИЮ ПРОДАВЦУ', itog_val, bold=True, fill=TOTAL)
+        r_itog = row
+        if itog_from_data is not None:
+            data_row(row, 'ИТОГО К ПЕРЕЧИСЛЕНИЮ ПРОДАВЦУ', itog_from_data, bold=True, fill=TOTAL)
+        else:
+            # Формула: ИТОГО продаж + ИТОГО начислений
+            _write_cell(ws, row, 1, 'ИТОГО К ПЕРЕЧИСЛЕНИЮ ПРОДАВЦУ', TOTAL, bold=True, align=left())
+            c = ws.cell(row=row, column=2)
+            c.value = f'=B{r_prod_itog}+B{r_nach_itog}'
+            c.number_format = '#,##0'
+            c.fill = hfill(TOTAL)
+            c.font = hfont(bold=True)
         row += 1
 
-        # % от продаж
-        if prod_total:
-            pct = itog_val / prod_total
-            _write_cell(ws, row, 1, 'Итого к оплате, % от суммы продаж', BEIGE, align=left())
-            _write_cell(ws, row, 2, pct, BEIGE, fmt='0.0%')
+        # % от продаж — формула
+        _write_cell(ws, row, 1, 'Итого к оплате, % от суммы продаж', BEIGE, align=left())
+        c = ws.cell(row=row, column=2)
+        c.value = f'=IF(B{r_prod_itog}<>0, B{r_itog}/B{r_prod_itog}, 0)'
+        c.number_format = '0.0%'
+        c.fill = hfill(BEIGE)
         row += 1
     else:
         ws.merge_cells(f'A{row}:B{row}')
@@ -1060,17 +1108,20 @@ def _extract_wb_metrics(df: pd.DataFrame) -> dict:
             s = s[mask]
         return float(s.sum())
 
-    # ПРОДАЖИ
+    # ПРОДАЖИ — только строки "Продажа" / "Возврат"
     qty_sold     = col_sum(qty_col, mask_sale)
     qty_returned = abs(col_sum(qty_col, mask_return))
     qty_net      = qty_sold - qty_returned
 
-    retail_total = col_sum(retail_col)        # Розничная цена с учётом скидки (все строки)
-    wb_real      = col_sum(wb_real_col)       # WB реализовал товар
-    money_net    = col_sum(money_col)         # К перечислению за товар (нетто, все строки)
+    # Розничная цена и WB реализовал — только по строкам Продажа (не Хранение/Штрафы)
+    retail_total = col_sum(retail_col, mask_sale)
+    wb_real      = col_sum(wb_real_col, mask_sale)
 
-    # КОМИССИЯ = Розница − К перечислению
-    commission   = retail_total - money_net if retail_total else 0.0
+    # К перечислению — сумма по всем строкам Продажа+Возврат (возвраты уже отрицательные)
+    money_net    = col_sum(money_col, mask_sale) + col_sum(money_col, mask_return)
+
+    # КОМИССИЯ = WB реализовал − К перечислению (только продажи)
+    commission   = wb_real - col_sum(money_col, mask_sale) if wb_real else 0.0
     commission_pct = (commission / retail_total) if retail_total else 0.0
 
     # РАСХОДЫ
@@ -1161,54 +1212,85 @@ def _build_wb_svod(ws, df: pd.DataFrame, period: str, sebes_dict: dict):
     # ── ПРОДАЖИ ──
     title_row(row, 'ПРОДАЖИ', GREEN)
     row += 1
+    r_qty_sold = row
     data_row(row, 'Продано штук (продажи)',                   m['qty_sold'],     '#,##0', fill=WHITE)
     row += 1
+    r_qty_ret = row
     data_row(row, 'Возвращено штук (возвраты)',                m['qty_returned'], '#,##0', fill=WHITE)
     row += 1
-    data_row(row, 'Продано нетто (продажи − возвраты), шт.',  m['qty_net'],      '#,##0', fill=WHITE)
+    # Нетто = формула
+    _write_cell(ws, row, 1, 'Продано нетто (продажи − возвраты), шт.', WHITE, align=left())
+    c = ws.cell(row=row, column=2)
+    c.value = f'=B{r_qty_sold}-B{r_qty_ret}'
+    c.number_format = '#,##0'
+    c.fill = hfill(WHITE)
     row += 1
+    r_retail = row
     data_row(row, 'Розничная цена с учётом скидки, ₽',        m['retail_total'], fill=WHITE)
     row += 1
+    r_wb_real = row
     data_row(row, 'WB реализовал товар (продажи клиентам), ₽', m['wb_real'],     fill=WHITE)
     row += 1
+    r_money = row
     data_row(row, 'К перечислению за товар (нетто), ₽',       m['money_net'],    fill=WHITE)
     row += 2
 
     # ── КОМИССИЯ ──
     title_row(row, 'КОМИССИЯ WILDBERRIES', YELLOW)
     row += 1
-    data_row(row, 'Комиссия WB (розничная − к перечислению), ₽', m['commission'],     fill=WHITE)
+    r_comm = row
+    # Комиссия = WB реализовал − К перечислению (формула)
+    _write_cell(ws, row, 1, 'Комиссия WB (розничная − к перечислению), ₽', WHITE, align=left())
+    c = ws.cell(row=row, column=2)
+    c.value = f'=B{r_wb_real}-B{r_money}'
+    c.number_format = '#,##0.00'
+    c.fill = hfill(WHITE)
     row += 1
-    data_row(row, 'Комиссия WB, % от розничной цены со скидкой',  m['commission_pct'], fmt='0.0%', fill=WHITE)
+    # % комиссии формула
+    _write_cell(ws, row, 1, 'Комиссия WB, % от розничной цены со скидкой', WHITE, align=left())
+    c = ws.cell(row=row, column=2)
+    c.value = f'=IF(B{r_retail}<>0, B{r_comm}/B{r_retail}, 0)'
+    c.number_format = '0.0%'
+    c.fill = hfill(WHITE)
     row += 2
 
     # ── РАСХОДЫ ──
     title_row(row, 'РАСХОДЫ (УСЛУГИ WB)', PINK)
     row += 1
-    data_row(row, 'Стоимость логистики, ₽',             m['cost_delivery'], fill=WHITE)
-    row += 1
-    data_row(row, 'Стоимость хранения, ₽',              m['cost_storage'],  fill=WHITE)
-    row += 1
-    data_row(row, 'Стоимость операций при приёмке, ₽',  m['cost_accept'],   fill=WHITE)
-    row += 1
-    data_row(row, 'Общая сумма штрафов, ₽',             m['cost_fines'],    fill=WHITE)
-    row += 1
-    data_row(row, 'Прочие удержания/выплаты, ₽',        m['cost_other'],    fill=WHITE)
-    row += 1
-    data_row(row, 'Корректировка Вознаграждения ВВ, ₽', m['cost_correct'],  fill=WHITE)
-    row += 1
-    data_row(row, 'ИТОГО РАСХОДОВ, ₽',                  m['total_costs'],   bold=True,
-             fill=COLORS['total_section'])
+    r_del = row;  data_row(row, 'Стоимость логистики, ₽',             m['cost_delivery'], fill=WHITE); row += 1
+    r_sto = row;  data_row(row, 'Стоимость хранения, ₽',              m['cost_storage'],  fill=WHITE); row += 1
+    r_acc = row;  data_row(row, 'Стоимость операций при приёмке, ₽',  m['cost_accept'],   fill=WHITE); row += 1
+    r_fin = row;  data_row(row, 'Общая сумма штрафов, ₽',             m['cost_fines'],    fill=WHITE); row += 1
+    r_oth = row;  data_row(row, 'Прочие удержания/выплаты, ₽',        m['cost_other'],    fill=WHITE); row += 1
+    r_cor = row;  data_row(row, 'Корректировка Вознаграждения ВВ, ₽', m['cost_correct'],  fill=WHITE); row += 1
+    r_tot_costs = row
+    # ИТОГО расходы — формула
+    _write_cell(ws, row, 1, 'ИТОГО РАСХОДОВ, ₽', COLORS['total_section'], bold=True, align=left())
+    c = ws.cell(row=row, column=2)
+    c.value = f'=СУММ(B{r_del}:B{r_cor})'
+    c.number_format = '#,##0.00'
+    c.fill = hfill(COLORS['total_section'])
+    c.font = hfont(bold=True)
     row += 2
 
     # ── ИТОГ ──
     title_row(row, 'ИТОГ', BEIGE)
     row += 1
-    data_row(row, 'ИТОГО К ОПЛАТЕ ПРОДАВЦУ, ₽',
-             m['total_payment'], bold=True, fill=COLORS['total_section'])
+    # ИТОГО К ОПЛАТЕ = К перечислению − Расходы (формула)
+    _write_cell(ws, row, 1, 'ИТОГО К ОПЛАТЕ ПРОДАВЦУ, ₽', COLORS['total_section'], bold=True, align=left())
+    c = ws.cell(row=row, column=2)
+    c.value = f'=B{r_money}-B{r_tot_costs}'
+    c.number_format = '#,##0.00'
+    c.fill = hfill(COLORS['total_section'])
+    c.font = hfont(bold=True)
+    r_itog = row
     row += 1
-    data_row(row, 'Итого к оплате, % от розничной цены со скидкой',
-             m['payment_pct'], fmt='0.0%', fill=WHITE)
+    # % к оплате формула
+    _write_cell(ws, row, 1, 'Итого к оплате, % от розничной цены со скидкой', WHITE, align=left())
+    c = ws.cell(row=row, column=2)
+    c.value = f'=IF(B{r_retail}<>0, B{r_itog}/B{r_retail}, 0)'
+    c.number_format = '0.0%'
+    c.fill = hfill(WHITE)
 
     _set_col_widths(ws, {'A': 52, 'B': 18})
 
