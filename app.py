@@ -128,19 +128,19 @@ def parse_1c_file(file_obj, channel_name: str, sebes_dict: dict) -> pd.DataFrame
 
 
 def parse_ozon_file(file_obj) -> dict:
-    xl = pd.ExcelFile(file_obj)
+    raw = file_obj.read()
+    xl = pd.ExcelFile(io.BytesIO(raw))
     result = {}
 
     for sh in xl.sheet_names:
-        df = pd.read_excel(xl, sheet_name=sh, header=None)
-        if 'Сводка' in sh or sh == 'Сводка':
+        sh_clean = sh.strip()
+        df = pd.read_excel(io.BytesIO(raw), sheet_name=sh, header=None)
+        if 'сводк' in sh_clean.lower():
             result['сводка'] = df
-        elif 'Детализация' in sh or sh == 'Детализация':
-            df2 = pd.read_excel(xl, sheet_name=sh, skiprows=0)
-            df2.columns = df2.iloc[0]
-            df2 = df2.iloc[1:].reset_index(drop=True)
+        elif 'детализ' in sh_clean.lower():
+            df2 = pd.read_excel(io.BytesIO(raw), sheet_name=sh)
             result['детализация'] = df2
-        elif 'типам' in sh.lower():
+        elif 'типам' in sh_clean.lower() or 'тип' in sh_clean.lower():
             result['по_типам'] = df
 
     return result
@@ -497,49 +497,43 @@ def _build_channel_sheet(ws, df_raw, channel_name: str, period: str, sebes_dict:
 
 
 def _parse_ms_channel_df(df_raw: pd.DataFrame, sebes_dict: dict) -> list:
+    """Конвертирует DataFrame из parse_1c_file в список строк для Excel."""
     rows = []
-    header_row = None
-    for i, r in df_raw.iterrows():
-        vals = [str(v).strip().lower() for v in r.values if pd.notna(v)]
-        if 'наименование' in vals:
-            header_row = i
-            break
-    if header_row is None:
+    if df_raw is None or df_raw.empty:
         return rows
 
-    for i in range(header_row + 1, len(df_raw)):
-        r = df_raw.iloc[i]
-        name = str(r.iloc[0]).strip() if pd.notna(r.iloc[0]) else ''
+    for _, r in df_raw.iterrows():
+        name = str(r.get('Наименование', '')).strip()
         if not name or name == 'nan':
             continue
 
-        qty      = r.iloc[1] if len(r) > 1 else None
-        rev      = r.iloc[2] if len(r) > 2 else None
-        sebes1   = r.iloc[3] if len(r) > 3 else None
-        sebes_all= r.iloc[4] if len(r) > 4 else None
-        profit   = r.iloc[5] if len(r) > 5 else None
-        margin   = r.iloc[6] if len(r) > 6 else None
+        qty      = r.get('Кол-во')
+        rev      = r.get('Сумма продаж')
+        sebes1   = r.get('Себес_авто') or r.get('Себес_1С')
+        profit   = r.get('Прибыль')
 
-        is_group = pd.isna(qty) and pd.isna(rev)
         try:
             qty_f = float(qty)
         except (TypeError, ValueError):
             qty_f = None
 
-        is_total = 'итого' in name.lower()
+        sebes1_val = _to_float(sebes1) or 0
+        sebes_all_val = sebes1_val * (qty_f or 0)
+        rev_val = _to_float(rev) or 0
+        profit_val = _to_float(profit) or 0
+        margin_val = (profit_val / rev_val) if rev_val else 0
 
-        sebes1_auto = get_sebes(name, sebes_dict)
-        sebes1_val = _to_float(sebes1) if pd.notna(sebes1) and _to_float(sebes1) > 0 else (sebes1_auto or 0)
+        is_total = 'итого' in name.lower()
 
         rows.append({
             'name':      name,
-            'qty':       qty_f if not is_group else None,
-            'rev':       _to_float(rev) if not is_group else None,
-            'sebes1':    sebes1_val if not is_group else None,
-            'sebes_all': _to_float(sebes_all) if not is_group else None,
-            'profit':    _to_float(profit) if not is_group else None,
-            'margin':    _to_float(margin) if not is_group else None,
-            'is_group':  is_group,
+            'qty':       qty_f,
+            'rev':       rev_val,
+            'sebes1':    sebes1_val,
+            'sebes_all': sebes_all_val,
+            'profit':    profit_val,
+            'margin':    margin_val,
+            'is_group':  False,
             'is_total':  is_total,
         })
 
