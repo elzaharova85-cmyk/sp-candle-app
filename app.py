@@ -176,20 +176,27 @@ def parse_ozon_file(file_obj) -> dict:
 
     for sh in xl.sheet_names:
         sh_low = sh.strip().lower()
-        if 'сводк' in sh_low or sh_low in ('сводка', 'summary'):
-            result['сводка'] = pd.read_excel(io.BytesIO(raw), sheet_name=sh, header=None)
-        elif 'детализ' in sh_low or sh_low in ('детализация', 'detail'):
+        # Лист с начислениями/сводкой
+        if any(x in sh_low for x in ('начислени', 'сводк', 'summary', 'финанс')):
+            result['начисления'] = pd.read_excel(io.BytesIO(raw), sheet_name=sh, header=None)
+        # Лист с детализацией по товарам
+        elif any(x in sh_low for x in ('детализ', 'detail', 'товар')):
             result['детализация'] = pd.read_excel(io.BytesIO(raw), sheet_name=sh)
-        elif 'типам' in sh_low or ('тип' in sh_low and 'товар' in sh_low):
+        # Лист по типам
+        elif any(x in sh_low for x in ('типам', 'тип')):
             result['по_типам'] = pd.read_excel(io.BytesIO(raw), sheet_name=sh, header=None)
 
-    # Если не нашли по имени — берём по позиции
-    if 'сводка' not in result and len(xl.sheet_names) >= 1:
-        result['сводка'] = pd.read_excel(io.BytesIO(raw), sheet_name=xl.sheet_names[0], header=None)
+    # Fallback по позиции — берём все листы
+    if 'начисления' not in result and len(xl.sheet_names) >= 1:
+        result['начисления'] = pd.read_excel(io.BytesIO(raw), sheet_name=xl.sheet_names[0], header=None)
     if 'детализация' not in result and len(xl.sheet_names) >= 2:
         result['детализация'] = pd.read_excel(io.BytesIO(raw), sheet_name=xl.sheet_names[1])
     if 'по_типам' not in result and len(xl.sheet_names) >= 3:
         result['по_типам'] = pd.read_excel(io.BytesIO(raw), sheet_name=xl.sheet_names[2], header=None)
+
+    # Обратная совместимость — дублируем под старым ключом
+    if 'начисления' in result:
+        result['сводка'] = result['начисления']
 
     return result
 
@@ -272,48 +279,109 @@ def _write_cell(ws, row, col, value, fill_color, bold=False, white=False,
 #  ГРУППИРОВКА ДАННЫХ КАНАЛА
 # ─────────────────────────────────────────────
 
+def get_product_type(name: str, sebes_dict: dict) -> str | None:
+    """
+    Определяет тип товара по ключам sebes_dict.
+    Возвращает ключ с наибольшим совпадением (самый длинный подходящий ключ).
+    """
+    n = name.lower().strip()
+    best = None
+    best_len = 0
+    for key in sebes_dict:
+        if key in n and len(key) > best_len:
+            best = key
+            best_len = len(key)
+    return best
+
+
 def group_channel_df(df: pd.DataFrame, sebes_dict: dict) -> dict:
     """
     Разбивает DataFrame канала на группы: основные, сопутствующие, доставка.
-    Возвращает dict с ключами 'основные', 'сопутствующие', 'доставка'.
-    Каждый ключ — список dict строк с полями:
-      name, qty, rev, sebes1, sebes_all, profit, margin
+    ОСНОВНЫЕ товары агрегируются по типу (ключи sebes_dict).
+    Возвращает dict:
+      'основные'      → список агрегированных строк по типу товара
+      'сопутствующие' → список строк по каждому товару (без группировки)
+      'доставка'      → список строк по доставке
     """
-    groups = {'основные': [], 'сопутствующие': [], 'доставка': []}
+    # Временные накопители для основных (по типу)
+    main_by_type: dict[str, dict] = {}   # key=тип, value=накопленные суммы
+    sop_rows = []
+    del_rows = []
 
     for _, r in df.iterrows():
         name = str(r.get('Наименование', '')).strip()
         if not name or name == 'nan':
             continue
 
-        qty_f     = _to_float(r.get('Кол-во'))
-        rev       = _to_float(r.get('Сумма продаж'))
-        profit    = _to_float(r.get('Прибыль'))
-        sebes_auto = r.get('Себес_авто')
-        sebes_1c   = _to_float(r.get('Себес_1С'))
-        # Себестоимость 1 ед: сначала авто, потом 1С
-        sebes1 = float(sebes_auto) if sebes_auto else sebes_1c
-        sebes_all = sebes1 * qty_f if qty_f else 0
-        margin = (profit / rev) if rev else 0
+        qty_f  = _to_float(r.get('Кол-во'))
+        rev    = _to_float(r.get('Сумма продаж'))
+        profit = _to_float(r.get('Прибыль'))
 
         cat = classify_item(name)
 
-        # Для доставки себестоимость = 0
         if cat == 'доставка':
-            sebes1 = 0
-            sebes_all = 0
+            del_rows.append({
+                'name':      name,
+                'qty':       qty_f,
+                'rev':       rev,
+                'sebes1':    0,
+                'sebes_all': 0,
+                'profit':    rev,   # доставка — прибыль = выручка
+                'margin':    1.0,
+            })
+            continue
 
-        groups[cat].append({
-            'name':      name,
-            'qty':       qty_f,
-            'rev':       rev,
-            'sebes1':    sebes1,
-            'sebes_all': sebes_all,
-            'profit':    profit,
+        # Определяем тип товара через sebes_dict
+        product_type = get_product_type(name, sebes_dict)
+        sebes1 = sebes_dict.get(product_type, 0) if product_type else 0
+        sebes_all = sebes1 * qty_f
+
+        if cat == 'основные' and product_type:
+            # Агрегируем по типу
+            # Нормализуем название типа: первая буква заглавная
+            type_display = product_type.capitalize()
+            if type_display not in main_by_type:
+                main_by_type[type_display] = {
+                    'qty': 0, 'rev': 0, 'sebes_all': 0, 'profit': 0,
+                    'sebes1': sebes1,
+                }
+            main_by_type[type_display]['qty']      += qty_f
+            main_by_type[type_display]['rev']      += rev
+            main_by_type[type_display]['sebes_all'] += sebes_all
+            main_by_type[type_display]['profit']   += profit
+        else:
+            # Сопутствующие или основные без известного типа → не агрегируем
+            sop_rows.append({
+                'name':      name,
+                'qty':       qty_f,
+                'rev':       rev,
+                'sebes1':    sebes1,
+                'sebes_all': sebes_all,
+                'profit':    profit,
+                'margin':    (profit / rev) if rev else 0,
+            })
+
+    # Преобразуем накопленные основные в список строк
+    main_rows = []
+    for type_name, t in main_by_type.items():
+        margin = (t['profit'] / t['rev']) if t['rev'] else 0
+        main_rows.append({
+            'name':      type_name,
+            'qty':       t['qty'],
+            'rev':       t['rev'],
+            'sebes1':    t['sebes1'],
+            'sebes_all': t['sebes_all'],
+            'profit':    t['profit'],
             'margin':    margin,
         })
+    # Сортируем по выручке убыванием
+    main_rows.sort(key=lambda x: x['rev'], reverse=True)
 
-    return groups
+    return {
+        'основные':      main_rows,
+        'сопутствующие': sop_rows,
+        'доставка':      del_rows,
+    }
 
 
 def calc_group_totals(rows: list) -> dict:
@@ -374,18 +442,19 @@ def build_excel(ms_data: dict, ozon_data: dict, wb_data: dict,
         ws_ozon_svod = wb.create_sheet('Ozon_Сводка')
         _build_ozon_svod(ws_ozon_svod, ozon_real, period)
 
+        ws_ozon_types = wb.create_sheet('Ozon_По типам')
+        _build_ozon_by_types(ws_ozon_types, ozon_real, period, sebes_dict)
+
         if 'детализация' in ozon_real:
             ws_ozon_det = wb.create_sheet('Ozon_Детализация')
             _build_ozon_detail(ws_ozon_det, ozon_real['детализация'], sebes_dict)
 
-        if 'по_типам' in ozon_real:
-            ws_ozon_types = wb.create_sheet('Ozon_По типам')
-            _build_raw_sheet(ws_ozon_types, ozon_real['по_типам'],
-                             'Продажи Ozon по типам товара', COLORS['ozon_blue'])
-
     if wb_data and 'детализация' in wb_data:
         ws_wb_svod = wb.create_sheet('WB_Сводка')
         _build_wb_svod(ws_wb_svod, wb_data['детализация'], period, sebes_dict)
+
+        ws_wb_types = wb.create_sheet('WB_По типам')
+        _build_wb_by_types(ws_wb_types, wb_data['детализация'], period, sebes_dict)
 
         ws_wb_det = wb.create_sheet('WB_Детализация')
         _build_wb_detail(ws_wb_det, wb_data['детализация'], sebes_dict)
@@ -581,12 +650,34 @@ def _build_svod_sheet(ws, svod_rows: list, ozon_data: dict, wb_data: dict, perio
         _write_cell(ws, row, ci, h, 'BDD7EE', bold=True, align=center())
     row += 1
 
-    ozon_summary = _extract_ozon_summary(ozon_data)
-    for stat, val in ozon_summary.items():
-        is_total = any(x in stat.lower() for x in ('итого', 'перечислению', 'начислено'))
+    # Берём итоговую сумму Ozon к перечислению
+    df_raw_ozon = ozon_data.get('начисления') or ozon_data.get('сводка')
+    ozon_itog = None
+    if df_raw_ozon is not None and not df_raw_ozon.empty:
+        sections = _parse_ozon_nacisleniya(df_raw_ozon)
+        prod_total  = sum(v for k, v in sections['продажи'].items()   if 'итого' not in k.lower())
+        nach_total  = sum(v for k, v in sections['начисления'].items() if 'итого' not in k.lower())
+        # Явное итого или вычисляем
+        for k, v in sections['итого'].items():
+            ozon_itog = v
+        if ozon_itog is None:
+            ozon_itog = prod_total + nach_total
+        rows_ozon = [
+            ('Продажи и возвраты (валовые)', prod_total),
+            ('Начисления / удержания Ozon',  nach_total),
+            ('ИТОГО К ПЕРЕЧИСЛЕНИЮ ПРОДАВЦУ', ozon_itog),
+        ]
+    else:
+        rows_ozon = []
+
+    for stat, val in rows_ozon:
+        is_total = 'итого' in stat.lower()
         fill = COLORS['total_section'] if is_total else COLORS['row_white']
         _write_cell(ws, row, 1, stat, fill, bold=is_total)
-        _write_cell(ws, row, 2, val, fill, bold=is_total, fmt='#,##0.00')
+        _write_cell(ws, row, 2, val,  fill, bold=is_total, fmt='#,##0.00')
+        row += 1
+    if not rows_ozon:
+        _write_cell(ws, row, 1, '⚠️ Файл Ozon не загружен', COLORS['row_white'])
         row += 1
     row += 1
 
@@ -618,58 +709,250 @@ def _build_svod_sheet(ws, svod_rows: list, ozon_data: dict, wb_data: dict, perio
 #  ЛИСТ: OZON
 # ─────────────────────────────────────────────
 
-def _extract_ozon_summary(ozon_data: dict) -> dict:
-    if not ozon_data or 'сводка' not in ozon_data:
-        return {}
-    df = ozon_data['сводка']
-    result = {}
-    for i, r in df.iterrows():
-        label = str(r.iloc[0]).strip() if pd.notna(r.iloc[0]) else ''
-        val   = r.iloc[1] if len(r) > 1 and pd.notna(r.iloc[1]) else None
-        if label and label != 'nan' and val is not None:
+def _parse_ozon_nacisleniya(df_raw: pd.DataFrame) -> dict:
+    """
+    Парсит лист начислений Ozon (header=None).
+    Ищет строки вида: [label, ..., value] и группирует их по секциям.
+    Возвращает dict вида:
+      {
+        'продажи': {'Выручка': 1221148, 'Программы партнёров': 9310, ...},
+        'начисления': {'Вознаграждение Ozon': -1194161, ...},
+        'итого': {'ИТОГО К ПЕРЕЧИСЛЕНИЮ ПРОДАВЦУ': 902057},
+      }
+    """
+    sections = {'продажи': {}, 'начисления': {}, 'итого': {}}
+    current_section = None
+
+    SECTION_MARKERS = {
+        'продажи': ['продаж', 'возврат'],
+        'начисления': ['начислени', 'удержани', 'вознаграждени', 'услуги'],
+        'итого': ['итого к перечислени', 'итого к оплате'],
+    }
+
+    for _, row in df_raw.iterrows():
+        vals = [v for v in row.values if pd.notna(v) and str(v).strip() not in ('', 'nan')]
+        if not vals:
+            continue
+
+        label = str(vals[0]).strip()
+        label_low = label.lower()
+
+        # Определяем секцию по метке
+        for sec, markers in SECTION_MARKERS.items():
+            if any(m in label_low for m in markers):
+                current_section = sec
+                break
+
+        # Ищем числовое значение в строке (последнее числовое значение в строке)
+        num_val = None
+        for v in reversed(vals):
             try:
-                result[label] = float(val)
+                num_val = float(v)
+                break
             except (TypeError, ValueError):
-                pass
-    return result
+                continue
+
+        if num_val is not None and current_section and label_low not in ('nan',):
+            # Пропускаем строки-заголовки секций (без числа они уже попали выше)
+            is_section_header = any(
+                label_low.startswith(m) for m in
+                ['продажи и возвраты', 'начисления', 'итог']
+            )
+            if not is_section_header:
+                sections[current_section][label] = num_val
+
+    # Считаем итоговые суммы если они не нашлись явно
+    if sections['продажи'] and 'ИТОГО Продажи и возвраты' not in sections['продажи']:
+        s = sum(sections['продажи'].values())
+        sections['продажи']['ИТОГО Продажи и возвраты'] = s
+
+    if sections['начисления'] and 'ИТОГО Начисления' not in sections['начисления']:
+        s = sum(sections['начисления'].values())
+        sections['начисления']['ИТОГО Начисления'] = s
+
+    return sections
 
 
 def _build_ozon_svod(ws, ozon_data: dict, period: str):
+    """Лист Ozon_Сводка — структура как в эталонном отчёте."""
     ws.sheet_view.showGridLines = False
-    ws.merge_cells('A1:C1')
-    c = ws['A1']
-    c.value = f'OZON — СВОДКА НАЧИСЛЕНИЙ — {period.upper()}'
-    c.fill = hfill(COLORS['ozon_blue'])
-    c.font = hfont(bold=True, white=True, size=12)
-    c.alignment = center()
-    ws.row_dimensions[1].height = 25
 
-    summary = _extract_ozon_summary(ozon_data)
+    BLUE   = COLORS['ozon_blue']
+    GREEN  = 'E2EFDA'
+    YELLOW = 'FFF2CC'
+    BEIGE  = 'F2F2F2'
+    WHITE  = COLORS['row_white']
+    TOTAL  = COLORS['total_section']
+
+    def title_row(r, text, color):
+        ws.merge_cells(f'A{r}:B{r}')
+        c = ws.cell(row=r, column=1, value=text)
+        c.fill = hfill(color)
+        c.font = hfont(bold=True, size=11)
+        c.alignment = left()
+        c.border = BORDER_THIN
+        ws.row_dimensions[r].height = 18
+
+    def data_row(r, label, value, bold=False, fill=WHITE, fmt='#,##0'):
+        _write_cell(ws, r, 1, label, fill, bold=bold, align=left())
+        _write_cell(ws, r, 2, value, fill, bold=bold, fmt=fmt)
+
+    row = 1
+    # Заголовок
+    ws.merge_cells(f'A{row}:B{row}')
+    c = ws.cell(row=row, column=1, value=f'Отчёт Ozon — {period}')
+    c.fill = hfill(BLUE)
+    c.font = hfont(bold=True, white=True, size=13)
+    c.alignment = left()
+    c.border = BORDER_THIN
+    ws.row_dimensions[row].height = 24
+    row += 2
+
+    # Получаем данные из листа начислений
+    df_raw = ozon_data.get('начисления') or ozon_data.get('сводка')
+
+    if df_raw is not None and not df_raw.empty:
+        sections = _parse_ozon_nacisleniya(df_raw)
+
+        # ── ПРОДАЖИ И ВОЗВРАТЫ ──
+        title_row(row, 'ПРОДАЖИ И ВОЗВРАТЫ', GREEN)
+        row += 1
+        prod_total = 0.0
+        for label, val in sections['продажи'].items():
+            is_total = 'итого' in label.lower()
+            fill_r = TOTAL if is_total else WHITE
+            data_row(row, label, val, bold=is_total, fill=fill_r)
+            if not is_total:
+                prod_total += val
+            row += 1
+        # Если ИТОГО не нашлось — пишем сами
+        if not any('итого' in l.lower() for l in sections['продажи']):
+            data_row(row, 'ИТОГО Продажи и возвраты', prod_total, bold=True, fill=TOTAL)
+            row += 1
+        row += 1
+
+        # ── НАЧИСЛЕНИЯ (УДЕРЖАНИЯ) ──
+        title_row(row, 'НАЧИСЛЕНИЯ (УДЕРЖАНИЯ OZON)', YELLOW)
+        row += 1
+        nach_total = 0.0
+        for label, val in sections['начисления'].items():
+            is_total = 'итого' in label.lower()
+            fill_r = TOTAL if is_total else WHITE
+            data_row(row, label, val, bold=is_total, fill=fill_r)
+            if not is_total:
+                nach_total += val
+            row += 1
+        if not any('итого' in l.lower() for l in sections['начисления']):
+            data_row(row, 'ИТОГО Начисления', nach_total, bold=True, fill=TOTAL)
+            row += 1
+        row += 1
+
+        # ── ИТОГ ──
+        title_row(row, 'ИТОГ', BEIGE)
+        row += 1
+
+        # Ищем итоговую сумму к перечислению
+        itog_val = None
+        for label, val in sections['итого'].items():
+            itog_val = val
+        if itog_val is None:
+            # Считаем: продажи + начисления
+            itog_val = prod_total + nach_total
+
+        data_row(row, 'ИТОГО К ПЕРЕЧИСЛЕНИЮ ПРОДАВЦУ', itog_val, bold=True, fill=TOTAL)
+        row += 1
+
+        # % от продаж
+        if prod_total:
+            pct = itog_val / prod_total
+            _write_cell(ws, row, 1, 'Итого к оплате, % от суммы продаж', BEIGE, align=left())
+            _write_cell(ws, row, 2, pct, BEIGE, fmt='0.0%')
+        row += 1
+    else:
+        ws.merge_cells(f'A{row}:B{row}')
+        c = ws.cell(row=row, column=1, value='⚠️ Данные Ozon не найдены — проверьте структуру файла')
+        c.fill = hfill('FCE4D6')
+        c.font = hfont(bold=True)
+
+    _set_col_widths(ws, {'A': 45, 'B': 18})
+
+
+def _build_ozon_by_types(ws, ozon_data: dict, period: str, sebes_dict: dict):
+    """
+    Лист Ozon_По типам — продажи по типам товара с себестоимостью.
+    Если есть лист 'детализация' — группируем по типу из него.
+    Иначе — показываем типы из sebes_dict с нулевым кол-вом.
+    """
+    ws.sheet_view.showGridLines = False
+
+    BLUE  = COLORS['ozon_blue']
+    LIGHT = 'D9E8FB'
+    WHITE = COLORS['row_white']
+    TOTAL = COLORS['total_section']
+
+    # Заголовок
+    ws.merge_cells('A1:D1')
+    c = ws['A1']
+    c.value = f'Продажи по типам товара - Ozon, {period}'
+    c.fill = hfill(BLUE)
+    c.font = hfont(bold=True, white=True, size=12)
+    c.alignment = left()
+    c.border = BORDER_THIN
+    ws.row_dimensions[1].height = 22
     row = 3
-    for ci, h in enumerate(['Статья', 'Сумма, руб.'], 1):
-        _write_cell(ws, row, ci, h, 'BDD7EE', bold=True, align=center())
+
+    # Шапка
+    for ci, h in enumerate(['Тип товара', 'Кол-во, шт', 'Себестоимость за 1 шт', 'Себес итого'], 1):
+        _write_cell(ws, row, ci, h, LIGHT, bold=True, align=center())
     row += 1
 
-    for stat, val in summary.items():
-        is_total = any(x in stat.lower() for x in ('итого', 'перечислению', 'начислено'))
-        fill = COLORS['total_section'] if is_total else COLORS['row_white']
-        _write_cell(ws, row, 1, stat, fill, bold=is_total)
-        _write_cell(ws, row, 2, val, fill, bold=is_total, fmt='#,##0.00')
+    # Группировка по типам из детализации
+    type_totals: dict[str, float] = {}
+
+    if 'детализация' in ozon_data:
+        df = ozon_data['детализация']
+        name_col = None
+        qty_col  = None
+        for col in df.columns:
+            cl = col.lower()
+            if 'название' in cl or 'наименование' in cl or 'товар' in cl:
+                name_col = col
+            if 'кол' in cl or 'количество' in cl:
+                qty_col = col
+
+        if name_col:
+            for _, r in df.iterrows():
+                name = str(r.get(name_col, '')).strip()
+                qty  = _to_float(r.get(qty_col, 1) if qty_col else 1)
+                ptype = get_product_type(name, sebes_dict)
+                if ptype:
+                    type_totals[ptype] = type_totals.get(ptype, 0) + qty
+
+    # Если детализации нет — берём все типы из sebes_dict с нулём
+    if not type_totals:
+        for key in sebes_dict:
+            type_totals[key] = 0.0
+
+    grand_qty   = 0.0
+    grand_sebes = 0.0
+    for ptype, qty in sorted(type_totals.items(), key=lambda x: -x[1]):
+        sebes1    = sebes_dict.get(ptype, 0)
+        sebes_all = sebes1 * qty
+        _write_cell(ws, row, 1, ptype.capitalize(), WHITE, align=left())
+        _write_cell(ws, row, 2, qty,       WHITE, fmt='#,##0')
+        _write_cell(ws, row, 3, sebes1,    WHITE, fmt='#,##0.00')
+        _write_cell(ws, row, 4, sebes_all, WHITE, fmt='#,##0.00')
+        grand_qty   += qty
+        grand_sebes += sebes_all
         row += 1
 
-    if 'по_типам' in ozon_data:
-        row += 1
-        df = ozon_data['по_типам']
-        ws.merge_cells(f'A{row}:F{row}')
-        c = ws[f'A{row}']
-        c.value = 'ПРОДАЖИ ПО ТИПАМ ТОВАРА (Ozon)'
-        c.fill = hfill(COLORS['ozon_blue'])
-        c.font = hfont(bold=True, white=True)
-        c.alignment = center()
-        row += 1
-        _dump_df_to_ws(ws, df, row)
+    # ИТОГО
+    _write_cell(ws, row, 1, 'ИТОГО', TOTAL, bold=True, align=left())
+    _write_cell(ws, row, 2, grand_qty,   TOTAL, bold=True, fmt='#,##0')
+    _write_cell(ws, row, 3, None,        TOTAL)
+    _write_cell(ws, row, 4, grand_sebes, TOTAL, bold=True, fmt='#,##0.00')
 
-    _set_col_widths(ws, {'A': 45, 'B': 16, 'C': 14, 'D': 14, 'E': 14, 'F': 16})
+    _set_col_widths(ws, {'A': 28, 'B': 14, 'C': 24, 'D': 16})
 
 
 def _build_ozon_detail(ws, df: pd.DataFrame, sebes_dict: dict):
@@ -706,59 +989,275 @@ def _build_ozon_detail(ws, df: pd.DataFrame, sebes_dict: dict):
 #  ЛИСТ: WB
 # ─────────────────────────────────────────────
 
-def _extract_wb_summary(wb_data: dict) -> dict:
-    if not wb_data or 'детализация' not in wb_data:
-        return {}
-    df = wb_data['детализация']
-    result = {}
+def _get_wb_col(df: pd.DataFrame, *candidates) -> str | None:
+    """Ищет первый подходящий столбец из кандидатов."""
+    for c in candidates:
+        for col in df.columns:
+            if c.lower() in col.lower():
+                return col
+    return None
 
-    money_col    = 'К перечислению Продавцу за реализованный Товар'
-    delivery_col = 'Услуги по доставке товара покупателю'
-    storage_col  = 'Хранение'
-    fine_col     = 'Общая сумма штрафов'
-    logistic_col = 'Возмещение издержек по перемещению и операционной обработке товара'
-    obosnov      = 'Обоснование для оплаты'
 
-    mask_sale = df.get(obosnov, pd.Series(dtype=str)) == 'Продажа'
-    if money_col in df.columns:
-        result['К перечислению за товар (Продажи)'] = float(df.loc[mask_sale, money_col].sum()) if mask_sale.any() else 0.0
-    if delivery_col in df.columns:
-        result['Услуги доставки'] = float(df[delivery_col].sum())
-    if storage_col in df.columns:
-        result['Хранение'] = float(df[storage_col].sum())
-    if logistic_col in df.columns:
-        result['Логистика (перемещение)'] = float(df[logistic_col].sum())
-    if fine_col in df.columns:
-        result['Штрафы'] = float(df[fine_col].sum())
-    if money_col in df.columns:
-        result['ИТОГО К ПЕРЕЧИСЛЕНИЮ'] = float(df[money_col].sum())
+def _wb_col_sum(df: pd.DataFrame, *candidates) -> float:
+    col = _get_wb_col(df, *candidates)
+    if col:
+        return float(df[col].fillna(0).sum())
+    return 0.0
 
-    return result
+
+def _extract_wb_metrics(df: pd.DataFrame) -> dict:
+    """
+    Считает все метрики WB из сырого DataFrame детализации.
+    Возвращает dict с именованными числами.
+    """
+    obosnov_col  = _get_wb_col(df, 'Обоснование для оплаты', 'обоснование')
+    qty_col      = _get_wb_col(df, 'Кол-во', 'количество')
+    retail_col   = _get_wb_col(df, 'Розничная цена с учётом скидки', 'розничная цена')
+    wb_real_col  = _get_wb_col(df, 'Вайлдберриз реализовал Товар', 'вб реализовал')
+    money_col    = _get_wb_col(df, 'К перечислению Продавцу за реализованный', 'к перечислению продавцу')
+    delivery_col = _get_wb_col(df, 'Услуги по доставке товара покупателю', 'доставк')
+    storage_col  = _get_wb_col(df, 'Хранение')
+    accept_col   = _get_wb_col(df, 'Стоимость операций при приёмке', 'приёмк', 'приемк')
+    fine_col     = _get_wb_col(df, 'Общая сумма штрафов', 'штраф')
+    other_col    = _get_wb_col(df, 'Прочие удержания', 'прочие выплаты')
+    correct_col  = _get_wb_col(df, 'Корректировка Вознаграждения ВВ', 'корректировка вознаграждения')
+    logistic_col = _get_wb_col(df, 'Возмещение издержек по перемещению', 'перемещени')
+
+    # Фильтры по обоснованию
+    if obosnov_col:
+        mask_sale   = df[obosnov_col].astype(str).str.strip() == 'Продажа'
+        mask_return = df[obosnov_col].astype(str).str.strip() == 'Возврат'
+    else:
+        mask_sale   = pd.Series([True] * len(df), index=df.index)
+        mask_return = pd.Series([False] * len(df), index=df.index)
+
+    def col_sum(col, mask=None):
+        if col is None:
+            return 0.0
+        s = df[col].fillna(0)
+        if mask is not None:
+            s = s[mask]
+        return float(s.sum())
+
+    # ПРОДАЖИ
+    qty_sold     = col_sum(qty_col, mask_sale)
+    qty_returned = abs(col_sum(qty_col, mask_return))
+    qty_net      = qty_sold - qty_returned
+
+    retail_total = col_sum(retail_col)        # Розничная цена с учётом скидки (все строки)
+    wb_real      = col_sum(wb_real_col)       # WB реализовал товар
+    money_net    = col_sum(money_col)         # К перечислению за товар (нетто, все строки)
+
+    # КОМИССИЯ = Розница − К перечислению
+    commission   = retail_total - money_net if retail_total else 0.0
+    commission_pct = (commission / retail_total) if retail_total else 0.0
+
+    # РАСХОДЫ
+    cost_delivery = col_sum(delivery_col)
+    cost_storage  = col_sum(storage_col)
+    cost_accept   = col_sum(accept_col)
+    cost_fines    = col_sum(fine_col)
+    cost_other    = col_sum(other_col)
+    cost_correct  = col_sum(correct_col)
+    cost_logistic = col_sum(logistic_col)
+    total_costs   = cost_delivery + cost_storage + cost_accept + cost_fines + cost_other + cost_correct
+
+    # ИТОГ К ОПЛАТЕ = К перечислению − расходы
+    total_payment = money_net - total_costs
+    payment_pct   = (total_payment / retail_total) if retail_total else 0.0
+
+    return {
+        # продажи
+        'qty_sold':       qty_sold,
+        'qty_returned':   qty_returned,
+        'qty_net':        qty_net,
+        'retail_total':   retail_total,
+        'wb_real':        wb_real,
+        'money_net':      money_net,
+        # комиссия
+        'commission':     commission,
+        'commission_pct': commission_pct,
+        # расходы
+        'cost_delivery':  cost_delivery,
+        'cost_storage':   cost_storage,
+        'cost_accept':    cost_accept,
+        'cost_fines':     cost_fines,
+        'cost_other':     cost_other,
+        'cost_correct':   cost_correct,
+        'total_costs':    total_costs,
+        # итог
+        'total_payment':  total_payment,
+        'payment_pct':    payment_pct,
+    }
 
 
 def _build_wb_svod(ws, df: pd.DataFrame, period: str, sebes_dict: dict):
+    """Лист WB_Сводка — структура как в эталонном отчёте."""
     ws.sheet_view.showGridLines = False
-    ws.merge_cells('A1:C1')
-    c = ws['A1']
-    c.value = f'WILDBERRIES — СВОДКА — {period.upper()}'
-    c.fill = hfill(COLORS['wb_violet'])
-    c.font = hfont(bold=True, white=True, size=12)
-    c.alignment = center()
 
-    summary = _extract_wb_summary({'детализация': df})
-    row = 3
-    for ci, h in enumerate(['Статья', 'Сумма, руб.'], 1):
-        _write_cell(ws, row, ci, h, 'BDD7EE', bold=True, align=center())
+    m = _extract_wb_metrics(df)
+
+    VIOLET = COLORS['wb_violet']
+    GREEN  = 'E2EFDA'   # светло-зелёный (ПРОДАЖИ)
+    YELLOW = 'FFF2CC'   # светло-жёлтый  (КОМИССИЯ)
+    PINK   = 'FCE4D6'   # светло-розовый (РАСХОДЫ)
+    BEIGE  = 'F2F2F2'   # светло-серый   (ИТОГ)
+    WHITE  = COLORS['row_white']
+
+    def title_row(r, text, color, ncols=2):
+        ws.merge_cells(f'A{r}:B{r}')
+        c = ws.cell(row=r, column=1, value=text)
+        c.fill = hfill(color)
+        c.font = hfont(bold=True, size=11)
+        c.alignment = left()
+        c.border = BORDER_THIN
+        ws.row_dimensions[r].height = 18
+
+    def data_row(r, label, value, fmt='#,##0.00', bold=False, fill=WHITE):
+        _write_cell(ws, r, 1, label, fill, bold=bold, align=left())
+        _write_cell(ws, r, 2, value, fill, bold=bold, fmt=fmt)
+
+    row = 1
+    # Заголовок
+    ws.merge_cells(f'A{row}:B{row}')
+    c = ws.cell(row=row, column=1, value=f'Отчёт Wildberries — {period}')
+    c.fill = hfill(VIOLET)
+    c.font = hfont(bold=True, white=True, size=13)
+    c.alignment = left()
+    c.border = BORDER_THIN
+    ws.row_dimensions[row].height = 24
     row += 1
 
-    for stat, val in summary.items():
-        is_total = 'итого' in stat.lower()
-        fill = COLORS['total_section'] if is_total else COLORS['row_white']
-        _write_cell(ws, row, 1, stat, fill, bold=is_total)
-        _write_cell(ws, row, 2, val, fill, bold=is_total, fmt='#,##0.00')
+    # Подзаголовок — период и номера отчётов
+    ws.merge_cells(f'A{row}:B{row}')
+    c = ws.cell(row=row, column=1,
+                value=f'Период: сводный отчёт за {period} (нарастающим итогом)')
+    c.fill = hfill(WHITE)
+    c.font = Font(italic=True, size=9, name='Calibri')
+    c.alignment = left()
+    row += 2
+
+    # ── ПРОДАЖИ ──
+    title_row(row, 'ПРОДАЖИ', GREEN)
+    row += 1
+    data_row(row, 'Продано штук (продажи)',                   m['qty_sold'],     '#,##0', fill=WHITE)
+    row += 1
+    data_row(row, 'Возвращено штук (возвраты)',                m['qty_returned'], '#,##0', fill=WHITE)
+    row += 1
+    data_row(row, 'Продано нетто (продажи − возвраты), шт.',  m['qty_net'],      '#,##0', fill=WHITE)
+    row += 1
+    data_row(row, 'Розничная цена с учётом скидки, ₽',        m['retail_total'], fill=WHITE)
+    row += 1
+    data_row(row, 'WB реализовал товар (продажи клиентам), ₽', m['wb_real'],     fill=WHITE)
+    row += 1
+    data_row(row, 'К перечислению за товар (нетто), ₽',       m['money_net'],    fill=WHITE)
+    row += 2
+
+    # ── КОМИССИЯ ──
+    title_row(row, 'КОМИССИЯ WILDBERRIES', YELLOW)
+    row += 1
+    data_row(row, 'Комиссия WB (розничная − к перечислению), ₽', m['commission'],     fill=WHITE)
+    row += 1
+    data_row(row, 'Комиссия WB, % от розничной цены со скидкой',  m['commission_pct'], fmt='0.0%', fill=WHITE)
+    row += 2
+
+    # ── РАСХОДЫ ──
+    title_row(row, 'РАСХОДЫ (УСЛУГИ WB)', PINK)
+    row += 1
+    data_row(row, 'Стоимость логистики, ₽',             m['cost_delivery'], fill=WHITE)
+    row += 1
+    data_row(row, 'Стоимость хранения, ₽',              m['cost_storage'],  fill=WHITE)
+    row += 1
+    data_row(row, 'Стоимость операций при приёмке, ₽',  m['cost_accept'],   fill=WHITE)
+    row += 1
+    data_row(row, 'Общая сумма штрафов, ₽',             m['cost_fines'],    fill=WHITE)
+    row += 1
+    data_row(row, 'Прочие удержания/выплаты, ₽',        m['cost_other'],    fill=WHITE)
+    row += 1
+    data_row(row, 'Корректировка Вознаграждения ВВ, ₽', m['cost_correct'],  fill=WHITE)
+    row += 1
+    data_row(row, 'ИТОГО РАСХОДОВ, ₽',                  m['total_costs'],   bold=True,
+             fill=COLORS['total_section'])
+    row += 2
+
+    # ── ИТОГ ──
+    title_row(row, 'ИТОГ', BEIGE)
+    row += 1
+    data_row(row, 'ИТОГО К ОПЛАТЕ ПРОДАВЦУ, ₽',
+             m['total_payment'], bold=True, fill=COLORS['total_section'])
+    row += 1
+    data_row(row, 'Итого к оплате, % от розничной цены со скидкой',
+             m['payment_pct'], fmt='0.0%', fill=WHITE)
+
+    _set_col_widths(ws, {'A': 52, 'B': 18})
+
+
+def _build_wb_by_types(ws, df: pd.DataFrame, period: str, sebes_dict: dict):
+    """Лист WB_По типам — продажи сгруппированы по типу товара с себестоимостью."""
+    ws.sheet_view.showGridLines = False
+
+    VIOLET = COLORS['wb_violet']
+    LIGHT  = 'D9D2E9'
+    WHITE  = COLORS['row_white']
+    TOTAL  = COLORS['total_section']
+
+    # Заголовок
+    ws.merge_cells('A1:D1')
+    c = ws['A1']
+    c.value = f'Продажи по типам товара - WB, {period}'
+    c.fill = hfill(VIOLET)
+    c.font = hfont(bold=True, white=True, size=12)
+    c.alignment = left()
+    c.border = BORDER_THIN
+    ws.row_dimensions[1].height = 22
+    row = 3
+
+    # Шапка
+    hdrs = ['Тип товара', 'Кол-во, шт', 'Себестоимость за 1 шт', 'Себес итого']
+    fills_h = [LIGHT, LIGHT, LIGHT, LIGHT]
+    for ci, h in enumerate(hdrs, 1):
+        _write_cell(ws, row, ci, h, LIGHT, bold=True, align=center())
+    row += 1
+
+    # Группировка по типу товара из sebes_dict
+    obosnov_col = _get_wb_col(df, 'Обоснование для оплаты')
+    name_col    = _get_wb_col(df, 'Название')
+    qty_col     = _get_wb_col(df, 'Кол-во', 'количество')
+
+    if obosnov_col:
+        df_sales = df[df[obosnov_col].astype(str).str.strip() == 'Продажа'].copy()
+    else:
+        df_sales = df.copy()
+
+    type_totals: dict[str, float] = {}
+    for _, r in df_sales.iterrows():
+        name = str(r.get(name_col, '') if name_col else '').strip()
+        qty  = _to_float(r.get(qty_col, 0) if qty_col else 0)
+        ptype = get_product_type(name, sebes_dict)
+        if ptype:
+            type_totals[ptype] = type_totals.get(ptype, 0) + qty
+
+    # Записываем строки (сортировка по убыванию кол-ва)
+    grand_qty   = 0.0
+    grand_sebes = 0.0
+    for ptype, qty in sorted(type_totals.items(), key=lambda x: -x[1]):
+        sebes1 = sebes_dict.get(ptype, 0)
+        sebes_all = sebes1 * qty
+        _write_cell(ws, row, 1, ptype.capitalize(), WHITE, align=left())
+        _write_cell(ws, row, 2, qty,      WHITE, fmt='#,##0')
+        _write_cell(ws, row, 3, sebes1,   WHITE, fmt='#,##0.00')
+        _write_cell(ws, row, 4, sebes_all, WHITE, fmt='#,##0.00')
+        grand_qty   += qty
+        grand_sebes += sebes_all
         row += 1
 
-    _set_col_widths(ws, {'A': 45, 'B': 16})
+    # ИТОГО
+    _write_cell(ws, row, 1, 'ИТОГО', TOTAL, bold=True, align=left())
+    _write_cell(ws, row, 2, grand_qty,   TOTAL, bold=True, fmt='#,##0')
+    _write_cell(ws, row, 3, None,        TOTAL)
+    _write_cell(ws, row, 4, grand_sebes, TOTAL, bold=True, fmt='#,##0.00')
+
+    _set_col_widths(ws, {'A': 30, 'B': 14, 'C': 22, 'D': 16})
 
 
 def _build_wb_detail(ws, df: pd.DataFrame, sebes_dict: dict):
