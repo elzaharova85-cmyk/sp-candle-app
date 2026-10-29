@@ -696,12 +696,29 @@ def _build_svod_sheet(ws, svod_rows: list, ozon_data: dict, wb_data: dict, perio
         _write_cell(ws, row, ci, h, 'BDD7EE', bold=True, align=center())
     row += 1
 
-    wb_summary = _extract_wb_summary(wb_data)
-    for stat, val in wb_summary.items():
-        is_total = 'итого' in stat.lower()
-        fill = COLORS['total_section'] if is_total else COLORS['row_white']
-        _write_cell(ws, row, 1, stat, fill, bold=is_total)
-        _write_cell(ws, row, 2, val, fill, bold=is_total, fmt='#,##0.00')
+    wb_detail_df = wb_data.get('детализация') if wb_data else None
+    if wb_detail_df is not None and not wb_detail_df.empty:
+        m = _extract_wb_metrics(wb_detail_df)
+        wb_svod_rows = [
+            ('Продажи (выручка WB)', m.get('retail_total', 0)),
+            ('К перечислению (нетто)', m.get('money_net', 0)),
+            ('Комиссия WB', m.get('commission', 0)),
+            ('Доставка', m.get('cost_delivery', 0)),
+            ('Хранение', m.get('cost_storage', 0)),
+            ('Приёмка', m.get('cost_accept', 0)),
+            ('Штрафы', m.get('cost_fines', 0)),
+            ('Прочие удержания', m.get('cost_other', 0)),
+            ('Итого расходы WB', m.get('total_costs', 0)),
+            ('ИТОГО К ПОЛУЧЕНИЮ', m.get('total_payment', 0)),
+        ]
+        for stat, val in wb_svod_rows:
+            is_total = 'итого' in stat.lower()
+            fill = COLORS['total_section'] if is_total else COLORS['row_white']
+            _write_cell(ws, row, 1, stat, fill, bold=is_total)
+            _write_cell(ws, row, 2, val, fill, bold=is_total, fmt='#,##0.00')
+            row += 1
+    else:
+        _write_cell(ws, row, 1, '⚠️ Файл WB не загружен', COLORS['row_white'])
         row += 1
 
     _set_col_widths(ws, {'A': 38, 'B': 14, 'C': 16, 'D': 16, 'E': 14, 'F': 10, 'G': 12, 'H': 12})
