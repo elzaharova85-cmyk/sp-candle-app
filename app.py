@@ -730,66 +730,132 @@ def _build_svod_sheet(ws, svod_rows: list, ozon_data: dict, wb_data: dict, perio
 
 def _parse_ozon_nacisleniya(df_raw: pd.DataFrame) -> dict:
     """
-    Парсит лист начислений Ozon (header=None).
-    Ищет ТОЛЬКО агрегированные статьи по ключевым словам (не детализацию по заказам).
-    Возвращает dict вида:
+    Парсит лист начислений Ozon. Поддерживает два формата:
+
+    ФОРМАТ 1 — детализация по операциям (новый формат Ozon 2025+):
+      Колонки: 'Группа услуг', 'Сумма итого, руб.' (+ ID начисления, дата и т.д.)
+      Строки: каждая операция с заказом/возвратом отдельной строкой.
+      Группируем по колонке 'Группа услуг'.
+
+    ФОРМАТ 2 — агрегатные строки (старый формат):
+      Строки вида: ['Выручка', ..., 1221148] — первая ячейка = название, последняя = сумма.
+      Ищем по белому списку ключевых слов.
+
+    Возвращает dict:
       {
-        'продажи': {'Выручка': 1221148, 'Программы партнёров': 9310, ...},
+        'продажи': {'Продажи': 2371610, 'Возвраты': -15904, ...},
         'начисления': {'Вознаграждение Ozon': -1194161, ...},
-        'итого': {'ИТОГО К ПЕРЕЧИСЛЕНИЮ ПРОДАВЦУ': 902057},
+        'итого': {},   # будет вычислен формулой
       }
     """
-    # Известные агрегированные статьи Ozon (ключевое слово → секция + отображаемое название)
+    sections: dict[str, dict] = {'продажи': {}, 'начисления': {}, 'итого': {}}
+
+    # Определяем формат файла.
+    # Если в первых 3 строках (или именах колонок) встречаются "Группа услуг" и "Сумма итого" —
+    # это новый формат детализации; иначе — старый агрегатный формат.
+    def _find_detail_cols(df):
+        """Ищет индексы колонок Группа услуг и Сумма итого в первых строках или заголовках."""
+        # Проверяем заголовки
+        for c in df.columns:
+            cs = str(c).lower()
+            if 'группа услуг' in cs or 'сумма итого' in cs:
+                # Есть именованные колонки — используем их
+                col_g = next((c for c in df.columns if 'группа услуг' in str(c).lower()), None)
+                col_s = next((c for c in df.columns if 'сумма итого' in str(c).lower()), None)
+                if col_g and col_s:
+                    return col_g, col_s, False  # (col_g, col_s, needs_re_read)
+        # Проверяем первые 3 строки как возможный заголовок
+        for i in range(min(3, len(df))):
+            row_vals = [str(v).lower() for v in df.iloc[i].values if pd.notna(v)]
+            has_g = any('группа услуг' in v for v in row_vals)
+            has_s = any('сумма итого' in v for v in row_vals)
+            if has_g and has_s:
+                # Находим номера колонок
+                row = df.iloc[i]
+                col_g = next((c for c in df.columns if 'группа услуг' in str(row[c]).lower()), None)
+                col_s = next((c for c in df.columns if 'сумма итого' in str(row[c]).lower()), None)
+                if col_g is not None and col_s is not None:
+                    return col_g, col_s, i + 1  # нужно пропустить i+1 строк
+        return None, None, None
+
+    col_g, col_s, header_row = _find_detail_cols(df_raw)
+
+    if col_g is not None and col_s is not None:
+        # ── ФОРМАТ 1: детализация по операциям ──
+        if header_row is False:
+            # Заголовки уже являются именами колонок
+            work_df = df_raw
+            gruppa_col = col_g
+            summa_col  = col_s
+        else:
+            # Перечитываем с нужным header
+            work_df = df_raw.iloc[header_row:].copy()
+            header = df_raw.iloc[header_row - 1]
+            work_df.columns = header.values
+            work_df = work_df.reset_index(drop=True)
+            gruppa_col = next(c for c in work_df.columns if 'группа услуг' in str(c).lower())
+            summa_col  = next(c for c in work_df.columns if 'сумма итого' in str(c).lower())
+
+        # Маппинг групп Ozon → наши секции и названия
+        GROUP_MAP = {
+            'продажи':                ('продажи',     'Продажи'),
+            'возвраты':               ('продажи',     'Возвраты'),
+            'вознаграждение ozon':    ('начисления',  'Вознаграждение Ozon'),
+            'продвижение и реклама':  ('начисления',  'Продвижение и реклама'),
+            'услуги доставки':        ('начисления',  'Услуги доставки'),
+            'услуги ozon доставки':   ('начисления',  'Услуги Ozon Доставки'),
+            'услуги партнёров':       ('начисления',  'Услуги партнёров'),
+            'другие услуги и штрафы': ('начисления',  'Другие услуги и штрафы'),
+            'услуги fbo':             ('начисления',  'Услуги FBO'),
+            'услуги fbs':             ('начисления',  'Услуги FBS'),
+        }
+
+        grouped = work_df.groupby(gruppa_col)[summa_col].sum()
+        for grp_name, total in grouped.items():
+            key = str(grp_name).strip().lower()
+            if key in GROUP_MAP:
+                sec, display = GROUP_MAP[key]
+                existing = sections[sec].get(display, 0)
+                sections[sec][display] = existing + float(total)
+
+        return sections
+
+    # ── ФОРМАТ 2: агрегатные строки с белым списком ──
     KNOWN_LABELS = {
-        # продажи
-        'выручка':                      ('продажи',     'Выручка'),
+        'выручка':                      ('продажи',     'Продажи'),
+        'продажи и возврат':            ('продажи',     'Продажи'),
         'программы партнёр':            ('продажи',     'Программы партнёров'),
         'баллы за скидк':               ('продажи',     'Баллы за скидки'),
         'итого продажи и возврат':      ('продажи',     'ИТОГО Продажи и возвраты'),
         'итого по продажам':            ('продажи',     'ИТОГО Продажи и возвраты'),
-        # начисления / удержания
         'вознаграждение ozon':          ('начисления',  'Вознаграждение Ozon'),
         'вознаграждение озон':          ('начисления',  'Вознаграждение Ozon'),
         'продвижение и реклам':         ('начисления',  'Продвижение и реклама'),
         'услуги доставк':               ('начисления',  'Услуги доставки'),
         'услуги по доставк':            ('начисления',  'Услуги доставки'),
         'услуги ozon доставк':          ('начисления',  'Услуги Ozon Доставки'),
-        'услуги озон доставк':          ('начисления',  'Услуги Ozon Доставки'),
         'услуги партнёр':               ('начисления',  'Услуги партнёров'),
         'другие услуги и штраф':        ('начисления',  'Другие услуги и штрафы'),
         'услуги fbo':                   ('начисления',  'Услуги FBO'),
         'услуги fbs':                   ('начисления',  'Услуги FBS'),
         'итого начислени':              ('начисления',  'ИТОГО Начисления'),
         'итого удержани':               ('начисления',  'ИТОГО Начисления'),
-        # итог
         'итого к перечислени':          ('итого',       'ИТОГО К ПЕРЕЧИСЛЕНИЮ ПРОДАВЦУ'),
         'итого к оплате':               ('итого',       'ИТОГО К ПЕРЕЧИСЛЕНИЮ ПРОДАВЦУ'),
-        'к перечислени':                ('итого',       'ИТОГО К ПЕРЕЧИСЛЕНИЮ ПРОДАВЦУ'),
     }
-
-    sections: dict[str, dict] = {'продажи': {}, 'начисления': {}, 'итого': {}}
 
     for _, row in df_raw.iterrows():
         vals = [v for v in row.values if pd.notna(v) and str(v).strip() not in ('', 'nan')]
         if len(vals) < 2:
             continue
-
-        label = str(vals[0]).strip()
-        label_low = label.lower()
-
-        # Проверяем по известным статьям
-        matched_sec = None
-        matched_display = None
+        label = str(vals[0]).strip().lower()
+        matched_sec = matched_display = None
         for kw, (sec, display) in KNOWN_LABELS.items():
-            if kw in label_low:
-                matched_sec = sec
-                matched_display = display
+            if kw in label:
+                matched_sec, matched_display = sec, display
                 break
-
         if matched_sec is None:
             continue
-
-        # Ищем числовое значение (последнее числовое в строке)
         num_val = None
         for v in reversed(vals):
             try:
@@ -797,9 +863,7 @@ def _parse_ozon_nacisleniya(df_raw: pd.DataFrame) -> dict:
                 break
             except (TypeError, ValueError):
                 continue
-
         if num_val is not None:
-            # Для одинаковых статей суммируем (напр. если несколько строк "Услуги доставки")
             existing = sections[matched_sec].get(matched_display, 0)
             sections[matched_sec][matched_display] = existing + num_val
 
@@ -1081,15 +1145,18 @@ def _extract_wb_metrics(df: pd.DataFrame) -> dict:
     """
     obosnov_col  = _get_wb_col(df, 'Обоснование для оплаты', 'обоснование')
     qty_col      = _get_wb_col(df, 'Кол-во', 'количество')
-    retail_col   = _get_wb_col(df, 'Розничная цена с учётом скидки', 'розничная цена')
-    wb_real_col  = _get_wb_col(df, 'Вайлдберриз реализовал Товар', 'вб реализовал')
+    # Розничная цена: может называться "Цена розничная с учетом согласованной скидки" или "Розничная цена с учётом скидки"
+    retail_col   = _get_wb_col(df, 'розничная с учет', 'розничная цена с учёт', 'розничн')
+    # WB реализовал: может иметь суффикс "(Пр)"
+    wb_real_col  = _get_wb_col(df, 'Вайлдберриз реализовал Товар', 'вб реализовал', 'реализовал товар')
     money_col    = _get_wb_col(df, 'К перечислению Продавцу за реализованный', 'к перечислению продавцу')
-    delivery_col = _get_wb_col(df, 'Услуги по доставке товара покупателю', 'доставк')
+    delivery_col = _get_wb_col(df, 'Услуги по доставке товара покупателю', 'услуги по доставк')
     storage_col  = _get_wb_col(df, 'Хранение')
-    accept_col   = _get_wb_col(df, 'Стоимость операций при приёмке', 'приёмк', 'приемк')
+    accept_col   = _get_wb_col(df, 'Операции на приемке', 'Стоимость операций при приёмке', 'приёмк', 'приемк')
     fine_col     = _get_wb_col(df, 'Общая сумма штрафов', 'штраф')
-    other_col    = _get_wb_col(df, 'Прочие удержания', 'прочие выплаты')
-    correct_col  = _get_wb_col(df, 'Корректировка Вознаграждения ВВ', 'корректировка вознаграждения')
+    # Прочие удержания: в файле WB называется "Удержания"
+    other_col    = _get_wb_col(df, 'Удержания', 'Прочие удержания', 'прочие выплаты')
+    correct_col  = _get_wb_col(df, 'Корректировка Вознаграждения', 'корректировка вознаграждения')
     logistic_col = _get_wb_col(df, 'Возмещение издержек по перемещению', 'перемещени')
 
     # Фильтры по обоснованию
